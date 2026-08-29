@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=dynSwap
+GenericName=Swap Space
+Comment=Set the amount of swap space on this system
+Exec=dynswap --gui
+Icon=de.synthelicz.dynSwap
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=swap;swapfile;zram;memory;RAM;swappiness;paging;
+StartupNotify=true
+StartupWMClass=de.synthelicz.dynSwap

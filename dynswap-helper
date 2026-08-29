@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Privileged entry point for dynswap. Invoked via pkexec or sudo."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from dynswap.helper import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())
