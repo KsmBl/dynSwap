@@ -6,6 +6,7 @@ privileged helper's events while it works.
 """
 from __future__ import annotations
 
+import getpass
 import math
 import threading
 
@@ -172,6 +173,108 @@ class ProgressDialog(Adw.Dialog):
     def log(self, line: str) -> None:
         end = self.buffer.get_end_iter()
         self.buffer.insert(end, line.rstrip() + "\n")
+
+
+class PasswordDialog(Adw.Dialog):
+    """Asks for the sudo password when no polkit agent is there to do it.
+
+    Desktops normally run a polkit agent that pops up for pkexec, but plenty of
+    minimal Wayland sessions do not start one, and pkexec then fails silently.
+    This dialog checks the password with sudo and leaves a sudo ticket behind
+    for the actual request.
+    """
+
+    MAX_ATTEMPTS = 3
+
+    def __init__(self, on_done):
+        super().__init__()
+        self.on_done = on_done
+        self.attempts = 0
+        self.finished = False
+        self.set_title("Authentication Required")
+        self.set_content_width(420)
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                      margin_top=6, margin_bottom=18, margin_start=18, margin_end=18)
+        icon = Gtk.Image(icon_name="dialog-password-symbolic", pixel_size=48)
+        icon.add_css_class("dim-label")
+        message = Gtk.Label(label="Changing swap needs administrator rights.",
+                            wrap=True, justify=Gtk.Justification.CENTER)
+
+        group = Adw.PreferencesGroup()
+        self.entry = Adw.PasswordEntryRow(title=f"Password for {getpass.getuser()}")
+        self.entry.connect("entry-activated", lambda _row: self._submit())
+        group.add(self.entry)
+
+        self.status = Gtk.Label(xalign=0.5, wrap=True)
+        self.status.add_css_class("error")
+        self.status.set_visible(False)
+        self.spinner = Gtk.Spinner(halign=Gtk.Align.CENTER, visible=False)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10,
+                          halign=Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda _b: self.close())
+        self.submit = Gtk.Button(label="Authenticate")
+        self.submit.add_css_class("suggested-action")
+        self.submit.connect("clicked", lambda _b: self._submit())
+        buttons.append(cancel)
+        buttons.append(self.submit)
+
+        for widget in (icon, message, group, self.status, self.spinner, buttons):
+            box.append(widget)
+        view.set_content(box)
+        self.set_child(view)
+        self.set_focus(self.entry)
+        self.connect("closed", lambda _d: self._finish(False))
+
+    def _submit(self) -> None:
+        password = self.entry.get_text()
+        if not password or not self.submit.get_sensitive():
+            return
+        self.entry.set_text("")
+        self._busy(True)
+        threading.Thread(target=self._check, args=(password,), daemon=True).start()
+
+    def _check(self, password: str) -> None:
+        accepted = actions.sudo_authenticate(password)
+        GLib.idle_add(self._checked, accepted)
+
+    def _checked(self, accepted: bool) -> bool:
+        self._busy(False)
+        if accepted:
+            self._finish(True)
+            self.force_close()
+            return GLib.SOURCE_REMOVE
+        self.attempts += 1
+        left = self.MAX_ATTEMPTS - self.attempts
+        if left <= 0:
+            self.force_close()           # "closed" reports the failure
+            return GLib.SOURCE_REMOVE
+        self.status.set_label(
+            f"Wrong password — {left} attempt{'s' if left != 1 else ''} left.")
+        self.status.set_visible(True)
+        self.entry.add_css_class("error")
+        self.set_focus(self.entry)
+        return GLib.SOURCE_REMOVE
+
+    def _busy(self, busy: bool) -> None:
+        self.entry.set_sensitive(not busy)
+        self.submit.set_sensitive(not busy)
+        self.spinner.set_visible(busy)
+        self.spinner.set_spinning(busy)
+        if busy:
+            self.status.set_visible(False)
+            self.entry.remove_css_class("error")
+
+    def _finish(self, accepted: bool) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        self.on_done(accepted)
 
 
 # --------------------------------------------------------------------------- #
@@ -644,6 +747,7 @@ class Window(Adw.ApplicationWindow):
         self.set_size_request(360, 480)
         self.dirty = False
         self.busy = False
+        self.agent_missing = False      # set once pkexec finds no polkit agent
 
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
@@ -787,8 +891,35 @@ class Window(Adw.ApplicationWindow):
     # -- privileged work --------------------------------------------------- #
 
     def run_request(self, request: list[str], title: str) -> None:
+        """Gain root the best way this session allows, then run the request.
+
+        Order: already root, a live sudo ticket, pkexec (the desktop's polkit
+        dialog), and finally our own password dialog when no polkit agent is
+        running to answer pkexec.
+        """
         if self.busy:
             return
+        if actions.is_root():
+            self._execute(request, title, "auto")
+        elif actions.sudo_ticket_valid():
+            self._execute(request, title, "sudo")
+        elif actions.has_pkexec() and not self.agent_missing:
+            self._execute(request, title, "pkexec")
+        elif actions.has_sudo():
+            self._ask_password(request, title)
+        else:
+            self.toast("No way to gain root: install polkit or sudo", 10)
+
+    def _ask_password(self, request: list[str], title: str) -> None:
+        def done(accepted: bool) -> None:
+            if accepted:
+                self._execute(request, title, "sudo")
+            else:
+                self.toast("Authentication cancelled")
+
+        PasswordDialog(done).present(self)
+
+    def _execute(self, request: list[str], title: str, prefer: str) -> None:
         self.busy = True
         progress = ProgressDialog(title)
         progress.present(self)
@@ -806,9 +937,14 @@ class Window(Adw.ApplicationWindow):
 
         def finish(result: actions.Result) -> bool:
             self.busy = False
-            self.dirty = False
             progress.set_can_close(True)
             progress.force_close()
+            if result.no_agent and actions.has_sudo():
+                # Nothing ran. Remember for this session and ask ourselves.
+                self.agent_missing = True
+                self._ask_password(request, title)
+                return GLib.SOURCE_REMOVE
+            self.dirty = False
             self.reload(force=True)
             toast = Adw.Toast(title=result.message,
                               timeout=5 if result.ok else 10)
@@ -816,7 +952,7 @@ class Window(Adw.ApplicationWindow):
             return GLib.SOURCE_REMOVE
 
         def worker() -> None:
-            result = actions.run_helper(request, on_event, prefer="pkexec")
+            result = actions.run_helper(request, on_event, prefer=prefer)
             GLib.idle_add(finish, result)
 
         threading.Thread(target=worker, daemon=True).start()

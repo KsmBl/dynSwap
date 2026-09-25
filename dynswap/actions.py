@@ -26,6 +26,9 @@ class Result:
     ok: bool
     message: str
     log: list[str]
+    # pkexec found no polkit agent to ask for the password, so nothing ran;
+    # the caller can collect the password itself and retry through sudo.
+    no_agent: bool = False
 
 
 def helper_program() -> list[str]:
@@ -185,9 +188,16 @@ def run_helper(
     for noise in stderr.splitlines():
         if noise.strip():
             captured.append(noise.strip())
+    via_pkexec = argv[0] == "pkexec"
+    if via_pkexec and "authentication agent" in stderr.lower():
+        return Result(False, "no polkit authentication agent is running",
+                      captured, no_agent=True)
     if proc.returncode == 126:
         return Result(False, "authentication failed or was cancelled", captured)
     if proc.returncode == 127:
+        # pkexec uses 127 for "not authorized" too, not just a missing program
+        if via_pkexec:
+            return Result(False, "not authorized to change swap", captured)
         return Result(False, "helper not found — is dynswap installed?", captured)
     if "password" in stderr.lower() or "sudo:" in stderr.lower():
         return Result(False, "authentication required", captured)

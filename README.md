@@ -118,7 +118,9 @@ to happen — browsing costs nothing.
 
 The **GUI** goes through `pkexec`, so you get your desktop's own polkit dialog.
 The polkit policy `de.synthelicz.dynSwap.manage` is what puts a real
-description in it instead of a bare path.
+description in it instead of a bare path. Minimal Wayland sessions often run no
+polkit agent at all, which leaves `pkexec` nobody to ask; dynSwap notices and
+shows its own password dialog instead, checking the password through `sudo`.
 
 The **TUI** asks in its own dialog, without leaving the screen:
 
